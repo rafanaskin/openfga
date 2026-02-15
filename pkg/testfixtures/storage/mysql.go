@@ -2,15 +2,16 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
-	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
@@ -23,7 +24,12 @@ import (
 )
 
 const (
-	mySQLImage = "mysql:8"
+	mySQLContainerName = "open-fga-mysql"
+	mySQLImage         = "mysql:8"
+)
+
+var (
+	mySQLOnce sync.Once
 )
 
 type mySQLTestContainer struct {
@@ -56,72 +62,36 @@ func (m *mySQLTestContainer) RunMySQLTestContainer(t testing.TB) DatastoreTestCo
 		dockerClient.Close()
 	})
 
-	allImages, err := dockerClient.ImageList(context.Background(), image.ListOptions{
-		All: true,
+	ctx := context.Background()
+
+	images, err := dockerClient.ImageList(ctx, image.ListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("reference", mySQLImage),
+		),
 	})
 	require.NoError(t, err)
 
-	foundMysqlImage := false
-
-AllImages:
-	for _, image := range allImages {
-		for _, tag := range image.RepoTags {
-			if strings.Contains(tag, mySQLImage) {
-				foundMysqlImage = true
-				break AllImages
-			}
-		}
-	}
-
-	if !foundMysqlImage {
+	if len(images) == 0 {
 		t.Logf("Pulling image %s", mySQLImage)
-		reader, err := dockerClient.ImagePull(context.Background(), mySQLImage, image.PullOptions{})
+		reader, err := dockerClient.ImagePull(ctx, mySQLImage, image.PullOptions{})
 		require.NoError(t, err)
 
 		_, err = io.Copy(io.Discard, reader) // consume the image pull output to make sure it's done
 		require.NoError(t, err)
 	}
 
-	containerCfg := container.Config{
-		Env: []string{
-			"MYSQL_DATABASE=defaultdb",
-			"MYSQL_ROOT_PASSWORD=secret",
-		},
-		ExposedPorts: nat.PortSet{
-			nat.Port("3306/tcp"): {},
-		},
-		Image: mySQLImage,
+	name := mySQLContainerName + ulid.Make().String()
+	cont, found, err := getRunningContainer(ctx, dockerClient, mySQLContainerName, mySQLImage)
+	require.NoError(t, err, "failed to find running mysql container")
+
+	if !found {
+		mySQLOnce.Do(func() {
+			cont, err = runMySQLContainer(ctx, dockerClient, name)
+			require.NoError(t, err, "failed to run mysql container")
+		})
 	}
 
-	hostCfg := container.HostConfig{
-		AutoRemove:      true,
-		PublishAllPorts: true,
-		Tmpfs:           map[string]string{"/var/lib/mysql": ""},
-	}
-
-	name := "mysql-" + ulid.Make().String()
-
-	cont, err := dockerClient.ContainerCreate(context.Background(), &containerCfg, &hostCfg, nil, nil, name)
-	require.NoError(t, err, "failed to create mysql docker container")
-
-	t.Cleanup(func() {
-		t.Logf("stopping container %s", name)
-		timeoutSec := 5
-
-		err := dockerClient.ContainerStop(context.Background(), cont.ID, container.StopOptions{Timeout: &timeoutSec})
-		if err != nil && !errdefs.IsNotFound(err) {
-			t.Logf("failed to stop mysql container: %v", err)
-		}
-		t.Logf("stopped container %s", name)
-	})
-
-	err = dockerClient.ContainerStart(context.Background(), cont.ID, container.StartOptions{})
-	require.NoError(t, err, "failed to start mysql container")
-
-	containerJSON, err := dockerClient.ContainerInspect(context.Background(), cont.ID)
-	require.NoError(t, err)
-
-	p, ok := containerJSON.NetworkSettings.Ports["3306/tcp"]
+	p, ok := cont.NetworkSettings.Ports["3306/tcp"]
 	if !ok || len(p) == 0 {
 		require.Fail(t, "failed to get host port mapping from mysql container")
 	}
@@ -190,4 +160,40 @@ func (m *mySQLTestContainer) CreateSecondary(t testing.TB) error {
 
 func (m *mySQLTestContainer) GetSecondaryConnectionURI(includeCredentials bool) string {
 	return ""
+}
+
+func runMySQLContainer(ctx context.Context, cli *client.Client, containerName string) (*container.InspectResponse, error) {
+	containerCfg := container.Config{
+		Env: []string{
+			"MYSQL_DATABASE=" + databaseName,
+			"MYSQL_ROOT_PASSWORD=secret",
+		},
+		ExposedPorts: nat.PortSet{
+			nat.Port("3306/tcp"): {},
+		},
+		Image: mySQLImage,
+	}
+
+	hostCfg := container.HostConfig{
+		AutoRemove:      true,
+		PublishAllPorts: true,
+		Tmpfs:           map[string]string{"/var/lib/mysql": ""},
+	}
+
+	cont, err := cli.ContainerCreate(ctx, &containerCfg, &hostCfg, nil, nil, containerName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create mysql docker container: %w", err)
+	}
+
+	err = cli.ContainerStart(ctx, cont.ID, container.StartOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to start mysql container: %w", err)
+	}
+
+	inspect, err := cli.ContainerInspect(context.Background(), cont.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect %s container: %w", containerName, err)
+	}
+
+	return &inspect, nil
 }

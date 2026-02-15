@@ -5,6 +5,10 @@ import (
 	"testing"
 )
 
+const (
+	databaseName = "defaultdb"
+)
+
 // DatastoreTestContainer represents a runnable container for testing specific datastore engines.
 type DatastoreTestContainer interface {
 

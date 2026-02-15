@@ -2,15 +2,18 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
@@ -23,14 +26,18 @@ import (
 )
 
 const (
-	postgresImage = "postgres:17"
+	postgresContainerName = "openfga-test-postgres"
+	postgresImage         = "postgres:17"
 )
+
+var once sync.Once
 
 type postgresTestContainer struct {
 	addr     string
 	version  int64
 	username string
 	password string
+	database string
 	replica  *postgresReplicaContainer
 }
 
@@ -63,81 +70,37 @@ func (p *postgresTestContainer) RunPostgresTestContainer(t testing.TB) Datastore
 		dockerClient.Close()
 	})
 
-	allImages, err := dockerClient.ImageList(context.Background(), image.ListOptions{
-		All: true,
+	ctx := context.Background()
+
+	images, err := dockerClient.ImageList(ctx, image.ListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("reference", postgresImage),
+		),
 	})
 	require.NoError(t, err)
 
-	foundPostgresImage := false
-
-AllImages:
-	for _, image := range allImages {
-		for _, tag := range image.RepoTags {
-			if strings.Contains(tag, postgresImage) {
-				foundPostgresImage = true
-				break AllImages
-			}
-		}
-	}
-
-	if !foundPostgresImage {
+	if len(images) == 0 {
 		t.Logf("Pulling image %s", postgresImage)
-		reader, err := dockerClient.ImagePull(context.Background(), postgresImage, image.PullOptions{})
+		reader, err := dockerClient.ImagePull(ctx, postgresImage, image.PullOptions{})
 		require.NoError(t, err)
 
 		_, err = io.Copy(io.Discard, reader) // consume the image pull output to make sure it's done
 		require.NoError(t, err)
 	}
 
-	containerCfg := container.Config{
-		Env: []string{
-			"POSTGRES_DB=defaultdb",
-			"POSTGRES_PASSWORD=secret",
-		},
-		ExposedPorts: nat.PortSet{
-			nat.Port("5432/tcp"): {},
-		},
-		Image: postgresImage,
-		Cmd: []string{
-			"postgres",
-			"-c", "wal_level=replica",
-			"-c", "max_wal_senders=3",
-			"-c", "max_replication_slots=3",
-			"-c", "wal_keep_size=64MB",
-			"-c", "hot_standby=on",
-		},
+	cont, found, err := getRunningContainer(ctx, dockerClient, postgresContainerName, postgresImage)
+	require.NoError(t, err, "failed to find running postgres container")
+	dbName := databaseName + ulid.Make().String()
+
+	if !found {
+		once.Do(func() {
+			containerName := postgresContainerName + ulid.Make().String()
+			cont, err = runPostgresContainer(ctx, dockerClient, containerName, dbName)
+			require.NoError(t, err, "failed to run postgres container")
+		})
 	}
 
-	hostCfg := container.HostConfig{
-		AutoRemove:      true,
-		PublishAllPorts: true,
-		ExtraHosts:      []string{"host.docker.internal:host-gateway"},
-	}
-
-	name := "postgres-" + ulid.Make().String()
-
-	cont, err := dockerClient.ContainerCreate(context.Background(), &containerCfg, &hostCfg, nil, nil, name)
-	require.NoError(t, err, "failed to create postgres docker container")
-
-	t.Cleanup(func() {
-		t.Logf("stopping container %s", name)
-		timeoutSec := 5
-
-		err := dockerClient.ContainerStop(context.Background(), cont.ID, container.StopOptions{Timeout: &timeoutSec})
-		if err != nil && !errdefs.IsNotFound(err) {
-			t.Logf("failed to stop postgres container: %v", err)
-		}
-
-		t.Logf("stopped container %s", name)
-	})
-
-	err = dockerClient.ContainerStart(context.Background(), cont.ID, container.StartOptions{})
-	require.NoError(t, err, "failed to start postgres container")
-
-	containerJSON, err := dockerClient.ContainerInspect(context.Background(), cont.ID)
-	require.NoError(t, err)
-
-	m, ok := containerJSON.NetworkSettings.Ports["5432/tcp"]
+	m, ok := cont.NetworkSettings.Ports["5432/tcp"]
 	if !ok || len(m) == 0 {
 		require.Fail(t, "failed to get host port mapping from postgres container")
 	}
@@ -147,28 +110,22 @@ AllImages:
 		username: "postgres",
 		password: "secret",
 	}
+	require.NoError(t, waitForPostgres(pgTestContainer.GetConnectionURI(true)))
 
-	uri := fmt.Sprintf("postgres://%s:%s@%s/defaultdb?sslmode=disable", pgTestContainer.username, pgTestContainer.password, pgTestContainer.addr)
+	pgTestContainer.database = dbName
+	if err := createDatabase(ctx, dockerClient, cont.ID, pgTestContainer); err != nil {
+		require.Fail(t, "failed to create database in postgres container: %v", err)
+	}
+	require.NoError(t, waitForPostgres(pgTestContainer.GetConnectionURI(true)))
 
 	goose.SetLogger(goose.NopLogger())
+	goose.SetBaseFS(assets.EmbedMigrations)
 
-	db, err := goose.OpenDBWithDriver("pgx", uri)
+	db, err := goose.OpenDBWithDriver("pgx", pgTestContainer.GetConnectionURI(true))
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = db.Close()
 	})
-
-	backoffPolicy := backoff.NewExponentialBackOff()
-	backoffPolicy.MaxElapsedTime = 30 * time.Second
-	err = backoff.Retry(
-		func() error {
-			return db.Ping()
-		},
-		backoffPolicy,
-	)
-	require.NoError(t, err, "failed to connect to postgres container")
-
-	goose.SetBaseFS(assets.EmbedMigrations)
 
 	err = goose.Up(db, assets.PostgresMigrationDir)
 	require.NoError(t, err)
@@ -191,7 +148,7 @@ func (p *postgresTestContainer) GetConnectionURI(includeCredentials bool) string
 		"postgres://%s%s/%s?sslmode=disable",
 		creds,
 		p.addr,
-		"defaultdb",
+		p.database,
 	)
 }
 
@@ -441,4 +398,125 @@ func (p *postgresTestContainer) GetSecondaryConnectionURI(includeCredentials boo
 		p.replica.addr,
 		"defaultdb",
 	)
+}
+
+func getRunningContainer(ctx context.Context, cli *client.Client, containerName, imageName string) (*container.InspectResponse, bool, error) {
+	// Create filters
+	filterArgs := filters.NewArgs()
+	filterArgs.Add("name", containerName) // partial match on container name
+	filterArgs.Add("ancestor", imageName) // image name (ancestor)
+
+	// List containers using filters
+	containers, err := cli.ContainerList(ctx, container.ListOptions{
+		Filters: filterArgs,
+		Latest:  true,
+		Limit:   1,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+
+	if len(containers) == 0 {
+		return nil, false, nil
+	}
+
+	inspect, err := cli.ContainerInspect(context.Background(), containers[0].ID)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to inspect %s container: %w", containerName, err)
+	}
+
+	return &inspect, true, nil
+}
+
+func waitForPostgres(dsn string) error {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to open connection to postgres: %w", err)
+	}
+	defer db.Close()
+
+	backoffPolicy := backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(30 * time.Second))
+	if err := backoff.Retry(db.Ping, backoffPolicy); err != nil {
+		return fmt.Errorf("failed to connect to postgres container: %w", err)
+	}
+
+	return nil
+}
+
+func runPostgresContainer(ctx context.Context, cli *client.Client, containerName, dbName string) (*container.InspectResponse, error) {
+	containerCfg := container.Config{
+		Env: []string{
+			"POSTGRES_DB=" + dbName,
+			"POSTGRES_PASSWORD=secret",
+		},
+		ExposedPorts: nat.PortSet{
+			nat.Port("5432/tcp"): {},
+		},
+		Image: postgresImage,
+		Cmd: []string{
+			"postgres",
+			"-c", "wal_level=replica",
+			"-c", "max_wal_senders=3",
+			"-c", "max_replication_slots=3",
+			"-c", "wal_keep_size=64MB",
+			"-c", "hot_standby=on",
+		},
+	}
+
+	hostCfg := container.HostConfig{
+		AutoRemove:      true,
+		PublishAllPorts: true,
+		ExtraHosts:      []string{"host.docker.internal:host-gateway"},
+	}
+
+	cont, err := cli.ContainerCreate(ctx, &containerCfg, &hostCfg, nil, nil, containerName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create %s container: %w", containerName, err)
+	}
+
+	if err := cli.ContainerStart(context.Background(), cont.ID, container.StartOptions{}); err != nil {
+		return nil, fmt.Errorf("failed to start %s container: %w", containerName, err)
+	}
+
+	inspect, err := cli.ContainerInspect(context.Background(), cont.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect %s container: %w", containerName, err)
+	}
+
+	return &inspect, nil
+}
+
+func createDatabase(ctx context.Context, cli *client.Client, containerID string, pgTestContainer *postgresTestContainer) error {
+	execConfig := container.ExecOptions{
+		Cmd: []string{
+			"createdb",
+			"-U", pgTestContainer.username,
+			pgTestContainer.database,
+		},
+		Env: []string{
+			"PGPASSWORD=" + pgTestContainer.password,
+		},
+	}
+
+	exec, err := cli.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create exec for command %v: %w", execConfig.Cmd, err)
+	}
+
+	err = cli.ContainerExecStart(ctx, exec.ID, container.ExecStartOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to execute command %v: %w", execConfig.Cmd, err)
+	}
+
+	// Wait for command to complete.
+	inspect, err := cli.ContainerExecInspect(ctx, exec.ID)
+	if err != nil {
+		return fmt.Errorf("failed to inspect exec %v: %w", execConfig.Cmd, err)
+	}
+
+	if inspect.ExitCode != 0 {
+		return fmt.Errorf("command %v completed with exit code %d", execConfig.Cmd, inspect.ExitCode)
+	}
+
+	return nil
 }
