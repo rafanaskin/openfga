@@ -56,12 +56,15 @@ func (m memoryTestContainer) GetSecondaryConnectionURI(includeCredentials bool) 
 // RunDatastoreTestContainer constructs and runs a specific DatastoreTestContainer for the provided
 // datastore engine. If applicable, it also runs all existing database migrations.
 // The resources used by the test engine will be cleaned up after the test has finished.
+//
+// NOTE: PostgreSQL uses a shared container across tests, so it is not automatically cleaned up after each test.
+// Other datastores create isolated containers and perform per-test cleanup as usual.
 func RunDatastoreTestContainer(t testing.TB, engine string) DatastoreTestContainer {
 	switch engine {
 	case "mysql":
 		return NewMySQLTestContainer().RunMySQLTestContainer(t)
 	case "postgres":
-		return NewPostgresTestContainer().RunPostgresTestContainer(t)
+		return RunPostgresTestContainer(t)
 	case "memory":
 		return memoryTestContainer{}
 	case "sqlite":
