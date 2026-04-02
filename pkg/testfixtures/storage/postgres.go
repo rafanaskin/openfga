@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -24,6 +23,7 @@ import (
 const (
 	postgresImage           = "postgres:17-alpine"
 	postgresContainerPrefix = "openfga-test-postgres-"
+	postgresPort            = nat.Port("5432/tcp")
 
 	postgresDBPrefix   = "openfga-test-db-"
 	postgresTemplateDB = postgresDBPrefix + "template"
@@ -117,7 +117,7 @@ func RunPostgresTestContainer(t testing.TB) DatastoreTestContainer {
 		dockerCont = bootstrapPostgresContainer(t, docker)
 	}
 
-	port, err := postgresContainerPort(dockerCont)
+	port, err := docker.GetHostPort(dockerCont, postgresPort)
 	require.NoError(t, err)
 
 	testCont := &postgresTestContainer{
@@ -156,14 +156,19 @@ func RunPostgresTestContainer(t testing.TB) DatastoreTestContainer {
 	require.NoError(t, err)
 	defer db.Close()
 
-	version, err := goose.GetDBVersion(db)
-	require.NoError(t, err)
-	testCont.version = version
-
 	migrations, err := goose.CollectMigrations(assets.PostgresMigrationDir, 0, goose.MaxVersion)
 	require.NoError(t, err)
 	require.NotEmpty(t, migrations)
-	require.Equal(t, migrations[len(migrations)-1].Version, version)
+	expVersion := migrations[len(migrations)-1].Version
+
+	require.Eventually(t, func() bool {
+		version, err := goose.GetDBVersion(db)
+		if err != nil {
+			return false
+		}
+		testCont.version = version
+		return version == expVersion
+	}, 1*time.Minute, 1*time.Second, "wait for mysql database to be ready")
 
 	return testCont
 }
@@ -180,7 +185,7 @@ func bootstrapPostgresContainer(t testing.TB, docker *testutils.DockerClient) *c
 			"POSTGRES_PASSWORD=" + postgresPassword,
 		},
 		ExposedPorts: nat.PortSet{
-			nat.Port("5432/tcp"): {},
+			postgresPort: {},
 		},
 		Image: postgresImage,
 		Cmd: []string{
@@ -204,7 +209,7 @@ func bootstrapPostgresContainer(t testing.TB, docker *testutils.DockerClient) *c
 	cont, err := docker.RunContainer(t.Context(), contCfg, hostCfg, containerName)
 	require.NoError(t, err, "run postgres container")
 
-	port, err := postgresContainerPort(cont)
+	port, err := docker.GetHostPort(cont, postgresPort)
 	require.NoError(t, err)
 
 	dbURI := postgresConnectionURI("localhost", port, postgresTemplateDB, postgresUsername, postgresPassword)
@@ -251,7 +256,7 @@ func runPostgresReplica(t testing.TB, primary *postgresTestContainer) *postgresR
 			"POSTGRES_MASTER_PORT=" + primary.port,
 		},
 		ExposedPorts: nat.PortSet{
-			nat.Port("5432/tcp"): {},
+			postgresPort: {},
 		},
 		Image:      postgresImage,
 		Entrypoint: []string{"/bin/bash", "-c"},
@@ -308,7 +313,7 @@ exec docker-entrypoint.sh postgres -c hot_standby=on -c max_connections=200
 		t.Logf("stopped replica container %s", contName)
 	})
 
-	port, err := postgresContainerPort(cont)
+	port, err := docker.GetHostPort(cont, postgresPort)
 	require.NoError(t, err)
 
 	replicaCont := &postgresReplicaContainer{
@@ -369,15 +374,6 @@ func waitForPostgresReplicaSync(t testing.TB, uri string) error {
 		},
 		backoffPolicy,
 	)
-}
-
-func postgresContainerPort(inspect *container.InspectResponse) (string, error) {
-	m, ok := inspect.NetworkSettings.Ports["5432/tcp"]
-	if !ok || len(m) == 0 {
-		return "", errors.New("get host port mapping from postgres container")
-	}
-
-	return m[0].HostPort, nil
 }
 
 func postgresConnectionURI(host, port, database, username, password string) string {

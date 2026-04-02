@@ -290,6 +290,55 @@ func TestExecCommand_Fail(t *testing.T) {
 	})
 }
 
+func TestGetHostPort(t *testing.T) {
+	t.Run("returns_host_port", func(t *testing.T) {
+		dc := &DockerClient{}
+		networkSettings := &container.NetworkSettings{}
+		networkSettings.Ports = nat.PortMap{
+			"5432/tcp": []nat.PortBinding{
+				{HostIP: "0.0.0.0", HostPort: "54321"},
+			},
+		}
+		inspect := &container.InspectResponse{
+			NetworkSettings: networkSettings,
+		}
+
+		port, err := dc.GetHostPort(inspect, nat.Port("5432/tcp"))
+		require.NoError(t, err)
+		require.Equal(t, "54321", port)
+	})
+
+	t.Run("returns_error_when_port_missing", func(t *testing.T) {
+		dc := &DockerClient{}
+		networkSettings := &container.NetworkSettings{}
+		networkSettings.Ports = nat.PortMap{}
+		inspect := &container.InspectResponse{
+			NetworkSettings: networkSettings,
+		}
+
+		port, err := dc.GetHostPort(inspect, nat.Port("5432/tcp"))
+		require.Empty(t, port)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "port bindings not available for container port 5432/tcp")
+	})
+
+	t.Run("returns_error_when_binding_empty", func(t *testing.T) {
+		dc := &DockerClient{}
+		networkSettings := &container.NetworkSettings{}
+		networkSettings.Ports = nat.PortMap{
+			"5432/tcp": []nat.PortBinding{},
+		}
+		inspect := &container.InspectResponse{
+			NetworkSettings: networkSettings,
+		}
+
+		port, err := dc.GetHostPort(inspect, nat.Port("5432/tcp"))
+		require.Empty(t, port)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "port bindings not available for container port 5432/tcp")
+	})
+}
+
 type dockerMockStep struct {
 	Method string
 	Path   string

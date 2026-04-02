@@ -11,6 +11,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
+	"github.com/docker/go-connections/nat"
 )
 
 // DockerClient is a simple wrapper around the Docker client
@@ -192,4 +193,14 @@ func (d *DockerClient) ExecCommand(ctx context.Context, containerID string, exec
 	}
 
 	return nil
+}
+
+// GetHostPort returns the published host port for the given container port.
+func (d *DockerClient) GetHostPort(inspect *container.InspectResponse, containerPort nat.Port) (string, error) {
+	m, ok := inspect.NetworkSettings.Ports[containerPort]
+	if !ok || len(m) == 0 {
+		return "", fmt.Errorf("port bindings not available for container port %s", containerPort)
+	}
+
+	return m[0].HostPort, nil
 }

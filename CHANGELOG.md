@@ -10,7 +10,6 @@ Try to keep listed changes to a concise bulleted list of simple explanations of 
 ### Changed
 - Reuse a single PostgreSQL container across tests by replacing the test fixture implementation, improving test performance and reducing resource usage. [#3018](https://github.com/openfga/openfga/pull/3018)
 
-
 ## [1.14.0] - 2026-04-03
 ### Added
 - Added `openfga_iter_query_duration_ms` histogram metric to track storage iterator query latency across all storage backends, labeled by `success`. The metric is recorded in each backend's `fetchBuffer` after error classification: infrastructure failures are labeled `success=false`; expected storage outcomes (`ErrNotFound`, `ErrCollision`, `ErrInvalidWriteInput`) are labeled `success=true`. [#3030](https://github.com/openfga/openfga/pull/3030)
