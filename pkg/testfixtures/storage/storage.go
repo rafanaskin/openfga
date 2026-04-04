@@ -62,7 +62,7 @@ func (m memoryTestContainer) GetSecondaryConnectionURI(includeCredentials bool) 
 func RunDatastoreTestContainer(t testing.TB, engine string) DatastoreTestContainer {
 	switch engine {
 	case "mysql":
-		return NewMySQLTestContainer().RunMySQLTestContainer(t)
+		return RunMysqlTestContainer(t)
 	case "postgres":
 		return RunPostgresTestContainer(t)
 	case "memory":
